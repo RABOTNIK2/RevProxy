@@ -1,7 +1,5 @@
 package main
 
-// Добавить: Сессионость, какой-то динамический алгоритм, retry
-
 import (
 	"context"
 	"log"
@@ -14,21 +12,28 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"sync"
 )
+
+const cookineName = "BALANCER_ID"
 
 type Backend struct{
 	URL *url.URL
 	Proxy *httputil.ReverseProxy
 	Alive atomic.Bool
+	ActiveConnections int64
 }
 
 type ReverseProxy struct{
 	backends []*Backend
-	current uint64
+	byHost map[string]*Backend
+	mu sync.RWMutex
 }
 
 func NewReverseProxy(backends []string) *ReverseProxy{
 	backs := make([]*Backend, len(backends))
+	byHost := make(map[string]*Backend)
+
 	for i, v := range backends{
 		parseUrl, err := url.Parse(v)
 		if err != nil {
@@ -51,8 +56,27 @@ func NewReverseProxy(backends []string) *ReverseProxy{
 			log.Printf("backend %s failed: %v", parseUrl, err)
     		http.Error(w, "bad gateway", http.StatusBadGateway)
 		}
+		byHost[parseUrl.Host] = backs[i]
 	}
-	return &ReverseProxy{backends: backs}
+
+	return &ReverseProxy{backends: backs, byHost: byHost}
+}
+
+func (p *ReverseProxy) leastConnected() *Backend{
+
+	var bestConn *Backend
+	var minConns int64 = -1
+
+	for _, b := range p.backends{
+		if !b.Alive.Load(){continue}
+		conns := atomic.LoadInt64(&b.ActiveConnections)
+		if minConns == -1 || conns < minConns{
+			minConns = conns
+			bestConn = b
+		}
+	}
+
+	return bestConn
 }
 
 func (p *ReverseProxy) healthCheck(ctx context.Context){
@@ -82,23 +106,44 @@ func (p *ReverseProxy) healthCheck(ctx context.Context){
 }
 
 func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request){
-	n := uint64(len(p.backends))
-	for i := uint64(0); i<n; i++{
-		idx := atomic.AddUint64(&p.current, 1) % n
-		proxy := p.backends[idx]
-		if proxy.Alive.Load(){
-			proxy.Proxy.ServeHTTP(w, r)
-			return
+	var back *Backend
+
+	if cookie, err := r.Cookie(cookineName); err == nil{
+		p.mu.Lock()
+		b, exists := p.byHost[cookie.Value]
+		p.mu.Unlock()
+		
+		if exists && b.Alive.Load(){
+			back = b
 		}
 	}
-	http.Error(w, "no healthy backs", http.StatusServiceUnavailable)
+
+	if back == nil{
+		back = p.leastConnected()
+		if back == nil{
+			http.Error(w, "no healthy backs", http.StatusServiceUnavailable)
+			return
+		}
+
+		http.SetCookie(w, &http.Cookie{
+			Name: cookineName,
+			Value: back.URL.Host,
+			Path: "/",
+			HttpOnly: true,
+		})
+	}
+
+	atomic.AddInt64(&back.ActiveConnections, 1)
+	defer atomic.AddInt64(&back.ActiveConnections, -1)
+
+	back.Proxy.ServeHTTP(w, r)
 }
 
 func main(){
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	backends := []string{"http://localhost:8081", "http://localhost:8001", "http://localhost:8002"}
+	backends := []string{"http://localhost:8001", "http://localhost:8002", "http://localhost:8003"}
     proxy := NewReverseProxy(backends)
 
     go proxy.healthCheck(ctx)
